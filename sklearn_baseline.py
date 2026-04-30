@@ -35,47 +35,71 @@ def add_time_features(df):
     df = df.copy()
     df['hour'] = df['times'].dt.hour
     df['minute'] = df['times'].dt.minute
-    df['dayofweek'] = df['times'].dt.dayofweek
+    #df['dayofweek'] = df['times'].dt.dayofweek
     df['month'] = df['times'].dt.month
     return df
 
 def load_and_process_nc(filepath):
+    """
+    读取单个 nc 文件，返回该日期的日度气象聚合特征 (一行数据)
+    包括：风速、辐照度的日均值、最大值、最小值、下午均值、凌晨均值
+    """
     import xarray as xr
 
     ds = xr.open_dataset(filepath)
 
-    u100 = ds['data'].sel(channel='u100')
+    # 提取 u100, v100, ghi
+    u100 = ds['data'].sel(channel='u100')   # (time, lead_time, lat, lon)
     v100 = ds['data'].sel(channel='v100')
     ghi  = ds['data'].sel(channel='ghi')
 
+    # 计算风速
     ws = np.sqrt(u100 ** 2 + v100 ** 2)
 
-    ws_mean = ws.mean(dim=['lat', 'lon'])
-    ghi_mean = ghi.mean(dim=['lat', 'lon'])
+    # 空间平均 → (time, lead_time)
+    ws_spatial = ws.mean(dim=['lat', 'lon'])
+    ghi_spatial = ghi.mean(dim=['lat', 'lon'])
 
-    ws_hourly = ws_mean.values.flatten()
-    ghi_hourly = ghi_mean.values.flatten()
+    # 取第一个时间步（通常 time=1），变成 24 小时序列
+    ws_hourly = ws_spatial.isel(time=0).values   # shape (24,)
+    ghi_hourly = ghi_spatial.isel(time=0).values
 
-    pub_date = pd.to_datetime(ds['time'].values[0])
-    target_date = pub_date + pd.Timedelta(days=1)
+    # ---- 聚合统计 ----
+    # 日均值
+    ws_mean = np.mean(ws_hourly)
+    ghi_mean = np.mean(ghi_hourly)
 
-    hours_orig = np.arange(24)
-    minutes_new = np.arange(96) * 15 / 60
-    ws_15min = np.interp(minutes_new, hours_orig, ws_hourly)
-    ghi_15min = np.interp(minutes_new, hours_orig, ghi_hourly)
+    # 日最大值 / 最小值
+    ws_max = np.max(ws_hourly)
+    ws_min = np.min(ws_hourly)
+    ghi_max = np.max(ghi_hourly)
+    ghi_min = np.min(ghi_hourly)
 
-    # 注意：去掉了 tz 参数
-    times = pd.date_range(
-        start=target_date,
-        periods=96,
-        freq='15min'
-    )
+    # 下午均值 (12-17 点，对应 lead_time 12-17)
+    ws_afternoon = np.mean(ws_hourly[12:18]) if len(ws_hourly) >= 18 else ws_mean
+    ghi_afternoon = np.mean(ghi_hourly[12:18]) if len(ghi_hourly) >= 18 else ghi_mean
+
+    # 凌晨均值 (0-5 点)
+    ws_night = np.mean(ws_hourly[0:6])
+    ghi_night = np.mean(ghi_hourly[0:6])
+
+    # 发布日期 +1 → 预测日期 (只保留日期部分)
+    pub_date = pd.to_datetime(str(ds['time'].values[0]))
+    target_date = pd.Timestamp(pub_date + pd.Timedelta(days=1)).date()
 
     ds.close()
+
     return pd.DataFrame({
-        'times': times,
-        'wind_speed': ws_15min,
-        'ghi': ghi_15min
+        'date': [target_date],
+        'ws_mean': ws_mean,
+        'ws_max': ws_max,
+        'ws_min': ws_min,
+        'ws_afternoon': ws_afternoon,
+        'ws_night': ws_night,
+        'ghi_mean': ghi_mean,
+        'ghi_max': ghi_max,
+        'ghi_afternoon': ghi_afternoon,
+        'ghi_night': ghi_night
     })
 
 # ==================== 充放电策略生成 ====================
@@ -212,14 +236,18 @@ if __name__ == '__main__':
     # 注意路径改成你刚才验证通过的路径
     nc_dir = '/mnt/workspace/all_nc/to_sais_new/all_nc'   # 或者用绝对路径
     nc_files = sorted(glob(os.path.join(nc_dir, '*.nc')))
+    
+    weather_feature_cols = [
+        'ws_mean', 'ws_max', 'ws_min', 'ws_afternoon', 'ws_night',
+        'ghi_mean', 'ghi_max', 'ghi_afternoon', 'ghi_night'
+    ]
 
     weather_dfs = []
-    print(f"开始加载 {len(nc_files)} 个气象文件...")
-    for idx, f in enumerate(nc_files, start=1):  # start=1 让计数从1开始更直观
+    print(f"开始加载 {len(nc_files)} 个气象文件（日度聚合）...")
+    for idx, f in enumerate(nc_files, start=1):
         try:
             wdf = load_and_process_nc(f)
             weather_dfs.append(wdf)
-            # 每处理 50 个文件，或处理第 1 个文件时，输出进度
             if idx % 50 == 0 or idx == 1:
                 print(f"  已处理 {idx}/{len(nc_files)} 个文件...")
         except Exception as e:
@@ -228,30 +256,27 @@ if __name__ == '__main__':
 
     if weather_dfs:
         weather_all = pd.concat(weather_dfs, ignore_index=True)
-        # 按 times 左连接（保留 df_train 所有行，气象缺失则为 NaN）
-        df_train = pd.merge(df_train, weather_all, on='times', how='left')
-        print("气象特征已合并，新增列：", [c for c in weather_all.columns if c != 'times'])
+        df_train['date'] = df_train['times'].dt.date
+        df_train = pd.merge(df_train, weather_all, on='date', how='left')
+        df_train = df_train.drop(columns=['date'])
+        new_weather_cols = [c for c in weather_all.columns if c != 'date']
+        print("气象特征已合并，新增列：", new_weather_cols)
     else:
         print("警告：未加载任何气象数据，请检查路径")
-    # --------------------------------------------
+        # 如果气象数据为空，仍需要创建空列以便后续代码统一
+        for col in weather_feature_cols:
+            df_train[col] = 0.0
 
     df_train = add_time_features(df_train)
-    all_features = feature_cols + ['hour', 'dayofweek', 'month', 'wind_speed', 'ghi']
-    # 填充气象特征的缺失值
-    df_train[['wind_speed', 'ghi']] = df_train[['wind_speed', 'ghi']].ffill()
-    
-    # === 新增：确保万无一失 ===
-    # 1. 检查是否还有 NaN
-    if df_train[['wind_speed', 'ghi']].isnull().any().any():
-        print("⚠️ 气象特征仍有缺失值，尝试用 0 填充...")
-        df_train[['wind_speed', 'ghi']] = df_train[['wind_speed', 'ghi']].fillna(0)
-    
-    # 2. 检查整个特征集
-    df_check = df_train[all_features]
-    if df_check.isnull().any().any():
-        print("⚠️ 特征矩阵仍存在 NaN，将再次填充（前向/0）...")
+    all_features = feature_cols + ['hour', 'month'] + weather_feature_cols
+
+    # 填充气象聚合特征的缺失值
+    df_train[weather_feature_cols] = df_train[weather_feature_cols].ffill().fillna(0)
+
+    # 最终全局检查
+    if df_train[all_features].isnull().any().any():
+        print("⚠️ 训练集特征矩阵仍有 NaN，再次填充...")
         df_train[all_features] = df_train[all_features].ffill().fillna(0)
-    # =======================
     
     X = df_train[all_features].values
     y = df_train[target_col].values
@@ -305,22 +330,19 @@ if __name__ == '__main__':
 
     if weather_test_dfs:
         weather_test_all = pd.concat(weather_test_dfs, ignore_index=True)
-        df_test = pd.merge(df_test, weather_test_all, on='times', how='left')
-        df_test[['wind_speed', 'ghi']] = df_test[['wind_speed', 'ghi']].ffill()
+        df_test['date'] = df_test['times'].dt.date
+        df_test = pd.merge(df_test, weather_test_all, on='date', how='left')
+        df_test = df_test.drop(columns=['date'])
+        df_test[weather_feature_cols] = df_test[weather_feature_cols].ffill().fillna(0)
+    else:
+        for col in weather_feature_cols:
+            df_test[col] = 0.0
+
     df_test = add_time_features(df_test)
-    
-    # === 新增：确保万无一失 ===
-    # 1. 检查是否还有 NaN
-    if df_test[['wind_speed', 'ghi']].isnull().any().any():
-        print("⚠️ 气象特征仍有缺失值，尝试用 0 填充...")
-        df_test[['wind_speed', 'ghi']] = df_test[['wind_speed', 'ghi']].fillna(0)
-    
-    # 2. 检查整个特征集
-    df_check = df_train[all_features]
-    if df_check.isnull().any().any():
-        print("⚠️ 特征矩阵仍存在 NaN，将再次填充（前向/0）...")
+
+    if df_test[all_features].isnull().any().any():
+        print("⚠️ 测试集特征矩阵仍有 NaN，再次填充...")
         df_test[all_features] = df_test[all_features].ffill().fillna(0)
-    # =======================
 
     X_test = df_test[all_features].values
     y_test_pred = model.predict(X_test)
