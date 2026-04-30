@@ -39,6 +39,44 @@ def add_time_features(df):
     df['month'] = df['times'].dt.month
     return df
 
+def load_and_process_nc(filepath):
+    import xarray as xr
+
+    ds = xr.open_dataset(filepath)
+
+    u100 = ds['data'].sel(channel='u100')
+    v100 = ds['data'].sel(channel='v100')
+    ghi  = ds['data'].sel(channel='ghi')
+
+    ws = np.sqrt(u100 ** 2 + v100 ** 2)
+
+    ws_mean = ws.mean(dim=['lat', 'lon'])
+    ghi_mean = ghi.mean(dim=['lat', 'lon'])
+
+    ws_hourly = ws_mean.values.flatten()
+    ghi_hourly = ghi_mean.values.flatten()
+
+    pub_date = pd.to_datetime(ds['time'].values[0])
+    target_date = pub_date + pd.Timedelta(days=1)
+
+    hours_orig = np.arange(24)
+    minutes_new = np.arange(96) * 15 / 60
+    ws_15min = np.interp(minutes_new, hours_orig, ws_hourly)
+    ghi_15min = np.interp(minutes_new, hours_orig, ghi_hourly)
+
+    # 注意：去掉了 tz 参数
+    times = pd.date_range(
+        start=target_date,
+        periods=96,
+        freq='15min'
+    )
+
+    ds.close()
+    return pd.DataFrame({
+        'times': times,
+        'wind_speed': ws_15min,
+        'ghi': ghi_15min
+    })
 
 # ==================== 充放电策略生成 ====================
 def generate_strategy(price_csv, save_path):
@@ -166,13 +204,58 @@ if __name__ == '__main__':
     df_train = pd.merge(df_feat, df_label, on='times', how='inner')
     df_train['times'] = pd.to_datetime(df_train['times'])
     print(f"  合并后: {df_train.shape}")
+    
+    # ------- 新增：加载气象数据并合并 -------
+    import xarray as xr
+    from glob import glob
 
-    df_train['price_lag_96'] = df_train[target_col].shift(96)
-    df_train = df_train.dropna(subset=['price_lag_96']).reset_index(drop=True)
-    all_features = feature_cols + ['hour', 'dayofweek', 'month', 'price_lag_96']
+    # 注意路径改成你刚才验证通过的路径
+    nc_dir = '/mnt/workspace/all_nc/to_sais_new/all_nc'   # 或者用绝对路径
+    nc_files = sorted(glob(os.path.join(nc_dir, '*.nc')))
 
+    weather_dfs = []
+    print(f"开始加载 {len(nc_files)} 个气象文件...")
+    for idx, f in enumerate(nc_files, start=1):  # start=1 让计数从1开始更直观
+        try:
+            wdf = load_and_process_nc(f)
+            weather_dfs.append(wdf)
+            # 每处理 50 个文件，或处理第 1 个文件时，输出进度
+            if idx % 50 == 0 or idx == 1:
+                print(f"  已处理 {idx}/{len(nc_files)} 个文件...")
+        except Exception as e:
+            print(f"跳过文件 {f}: {e}")
+    print("气象文件加载完成！")
+
+    if weather_dfs:
+        weather_all = pd.concat(weather_dfs, ignore_index=True)
+        # 按 times 左连接（保留 df_train 所有行，气象缺失则为 NaN）
+        df_train = pd.merge(df_train, weather_all, on='times', how='left')
+        print("气象特征已合并，新增列：", [c for c in weather_all.columns if c != 'times'])
+    else:
+        print("警告：未加载任何气象数据，请检查路径")
+    # --------------------------------------------
+
+    df_train = add_time_features(df_train)
+    all_features = feature_cols + ['hour', 'dayofweek', 'month', 'wind_speed', 'ghi']
+    # 填充气象特征的缺失值
+    df_train[['wind_speed', 'ghi']] = df_train[['wind_speed', 'ghi']].ffill()
+    
+    # === 新增：确保万无一失 ===
+    # 1. 检查是否还有 NaN
+    if df_train[['wind_speed', 'ghi']].isnull().any().any():
+        print("⚠️ 气象特征仍有缺失值，尝试用 0 填充...")
+        df_train[['wind_speed', 'ghi']] = df_train[['wind_speed', 'ghi']].fillna(0)
+    
+    # 2. 检查整个特征集
+    df_check = df_train[all_features]
+    if df_check.isnull().any().any():
+        print("⚠️ 特征矩阵仍存在 NaN，将再次填充（前向/0）...")
+        df_train[all_features] = df_train[all_features].ffill().fillna(0)
+    # =======================
+    
     X = df_train[all_features].values
     y = df_train[target_col].values
+
 
     # 按时间顺序划分，最后20%做验证
     split_idx = int(len(X) * 0.8)
@@ -208,25 +291,36 @@ if __name__ == '__main__':
     print("\n[3/4] 测试集推理...")
     df_test = pd.read_csv(test_feature_path)
     df_test['times'] = pd.to_datetime(df_test['times'])
+    
+    # 加载气象数据（复用刚才的 nc_files 即可）
+    # 如果之前已经加载了 weather_all，可以直接 merge（要保证 weather_all 包含测试集所有日期）
+    # 简单方式：直接重新生成一份 weather_all，然后 merge
+    weather_test_dfs = []
+    for f in nc_files:
+        try:
+            wdf = load_and_process_nc(f)
+            weather_test_dfs.append(wdf)
+        except Exception as e:
+            pass
+
+    if weather_test_dfs:
+        weather_test_all = pd.concat(weather_test_dfs, ignore_index=True)
+        df_test = pd.merge(df_test, weather_test_all, on='times', how='left')
+        df_test[['wind_speed', 'ghi']] = df_test[['wind_speed', 'ghi']].ffill()
     df_test = add_time_features(df_test)
-
-    # --- 核心逻辑：构造测试集的滞后特征 ---
-    # 1. 拿到训练集最后 96 个时刻的真实电价
-    last_known_prices = df_label[target_col].tail(96).values
-
-    # 2. 对于测试集的第一天（假设测试集是连续的 D+1, D+2...）
-    # price_lag_96 对应的就是训练集最后 96 个点的值
-    # 注意：如果测试集有多天，这里的逻辑需要更复杂的滚动拼接，
-    # 但对于本赛题（通常预测次日），直接拼接即可：
-    if len(df_test) == 96:
-        df_test['price_lag_96'] = last_known_prices
-    else:
-        # 如果测试集有多天，需要将已知电价拼在前面再做 shift
-        full_prices = np.concatenate([last_known_prices, np.zeros(len(df_test))]) 
-        # 这里是一个简化处理，实际上测试集第二天的 lag 应该是第一天的预测值（E2E思路）
-        # 或者只用已知最晚的 96 个点循环填充
-        df_test['price_lag_96'] = np.resize(last_known_prices, len(df_test))
-    # ------------------------------------
+    
+    # === 新增：确保万无一失 ===
+    # 1. 检查是否还有 NaN
+    if df_test[['wind_speed', 'ghi']].isnull().any().any():
+        print("⚠️ 气象特征仍有缺失值，尝试用 0 填充...")
+        df_test[['wind_speed', 'ghi']] = df_test[['wind_speed', 'ghi']].fillna(0)
+    
+    # 2. 检查整个特征集
+    df_check = df_train[all_features]
+    if df_check.isnull().any().any():
+        print("⚠️ 特征矩阵仍存在 NaN，将再次填充（前向/0）...")
+        df_test[all_features] = df_test[all_features].ffill().fillna(0)
+    # =======================
 
     X_test = df_test[all_features].values
     y_test_pred = model.predict(X_test)
@@ -235,7 +329,7 @@ if __name__ == '__main__':
     df_out.to_csv(output_price_path, index=False)
     print(f'  推理结果已保存: {output_price_path}')
     print(f'  预测天数: {len(df_out) // 96} 天')
-
+    
     # ==================== 4. 生成充放电策略 ====================
     print("\n[4/4] 生成充放电策略...")
     generate_strategy(output_price_path, output_power_path)
