@@ -5,4 +5,5 @@
   - 下一步: 进一步精简气象特征(保留ws_mean/ghi_afternoon等2-3个核心变量)
 
 5.1  本次版本：无气象 + 阈值 1250
-              精简气象版（ghi_mean+ghi_night）+ 阈值 2000
+
+     精简气象版（ghi_mean+ghi_night）+ 阈值 2000
